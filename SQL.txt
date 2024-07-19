@@ -1,0 +1,305 @@
+DROP TABLE IF EXISTS actor_rental_summary;
+CREATE TABLE actor_rental_summary (
+    actor_id INT PRIMARY KEY,
+    first_name TEXT,
+    last_name TEXT,
+    total_rentals INT DEFAULT 0,
+    avg_rental_duration INTERVAL
+);
+
+
+
+
+CREATE OR REPLACE PROCEDURE update_actor_rental_summary(
+    IN rental_id INT
+)
+LANGUAGE PLPGSQL
+AS $$
+DECLARE
+    actor_id1 INT;
+    avg_duration INTERVAL;
+BEGIN
+    -- Get the actor ID and average rental duration for the given rental
+    SELECT a.actor_id, AVG(r.return_date - r.rental_date) INTO actor_id1, avg_duration
+    FROM actor a
+    JOIN film_actor fa ON a.actor_id = fa.actor_id
+    JOIN film f ON fa.film_id = f.film_id
+    JOIN inventory i ON f.film_id = i.film_id
+    JOIN rental r ON i.inventory_id = r.inventory_id
+    WHERE r.rental_id = update_actor_rental_summary.rental_id
+    GROUP BY a.actor_id;
+
+ 
+UPDATE actor_rental_summary ars
+SET total_rentals = ars.total_rentals + 1,
+    avg_rental_duration = avg_duration
+FROM actor_rental_summary ars2
+WHERE ars.actor_id = actor_id1;
+
+
+    IF NOT FOUND THEN
+        INSERT INTO actor_rental_summary (actor_id, first_name, last_name, total_rentals, avg_rental_duration)
+        SELECT a.actor_id, a.first_name, a.last_name, 1, avg_duration
+        FROM actor a
+        WHERE a.actor_id = actor_id1;
+    END IF;
+END;
+$$;
+
+DO $$
+DECLARE
+    rec RECORD;
+    rental_cursor CURSOR FOR SELECT rental_id FROM rental;
+BEGIN
+    OPEN rental_cursor;
+    LOOP
+        FETCH rental_cursor INTO rec;
+        EXIT WHEN NOT FOUND;
+        CALL update_actor_rental_summary(rec.rental_id);
+    END LOOP;
+    CLOSE rental_cursor;
+END $$;
+
+
+CREATE OR REPLACE FUNCTION update_rental_summary_trigger_function()
+RETURNS TRIGGER AS $$
+BEGIN
+    PERFORM update_actor_rental_summary(NEW.rental_id);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+
+DROP TRIGGER IF EXISTS update_rental_summary ON rental;
+
+
+CREATE OR REPLACE FUNCTION update_actor_rental_summary_trigger_function()
+RETURNS TRIGGER AS $$
+BEGIN
+   
+    UPDATE actor_rental_summary
+    SET total_rentals = total_rentals + 1
+    WHERE actor_id = NEW.actor_id;
+
+   
+    UPDATE actor_rental_summary
+    SET avg_rental_duration = (
+        SELECT AVG(rental_duration)
+        FROM actor_rental_details
+        WHERE actor_id = NEW.actor_id
+    )
+    WHERE actor_id = NEW.actor_id;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS update_actor_rental_summary_trigger ON actor_rental_details;
+CREATE TRIGGER update_actor_rental_summary_trigger
+AFTER INSERT ON actor_rental_details
+FOR EACH ROW
+EXECUTE FUNCTION update_actor_rental_summary_trigger_function();
+--("PostgreSQL Triggers," n.d.)
+
+
+
+CREATE OR REPLACE FUNCTION format_duration(duration INTERVAL)
+RETURNS TEXT
+LANGUAGE PLPGSQL
+AS $$
+DECLARE
+    days INT;
+    hours INT;
+    minutes INT;
+    result TEXT;
+BEGIN
+    days := EXTRACT(DAY FROM duration);
+    hours := EXTRACT(HOUR FROM duration);
+    minutes := EXTRACT(MINUTE FROM duration);
+
+    result := '';
+    IF days > 0 THEN
+        result := result || days || ' days ';
+    END IF;
+    IF hours > 0 THEN
+        result := result || hours || ' hours ';
+    END IF;
+    IF minutes > 0 THEN
+        result := result || minutes || ' minutes';
+    END IF;
+
+    RETURN TRIM(result);
+END;
+$$;
+
+
+DROP TABLE IF EXISTS actor_rental_details;
+CREATE TABLE actor_rental_details (
+    rental_id INT,
+    actor_id INT,
+    actor_first_name TEXT,
+    actor_last_name TEXT,
+    rental_date DATE,
+    return_date DATE,
+    rental_duration INTERVAL,
+    film_title TEXT,
+	PRIMARY KEY (rental_id, actor_id)
+);
+CREATE OR REPLACE FUNCTION calculate_rental_duration(rental_date TIMESTAMP WITHOUT TIME ZONE, return_date TIMESTAMP WITHOUT TIME ZONE)
+RETURNS INTERVAL
+LANGUAGE SQL
+AS $$
+    SELECT (return_date - rental_date);
+$$;
+--("PostgreSQL Date Functions," n.d.)
+
+
+
+rental_duration field
+CREATE OR REPLACE PROCEDURE update_actor_rental_details()
+LANGUAGE PLPGSQL
+AS $$
+BEGIN
+    INSERT INTO actor_rental_details (
+        rental_id,
+        actor_id,
+        actor_first_name,
+        actor_last_name,
+        rental_date,
+        return_date,
+        rental_duration,
+        film_title
+    )
+    SELECT
+        r.rental_id,
+        a.actor_id,
+        a.first_name,
+        a.last_name,
+        r.rental_date,
+        r.return_date,
+        calculate_rental_duration(CAST(r.rental_date AS TIMESTAMP WITHOUT TIME ZONE), CAST(r.return_date AS TIMESTAMP WITHOUT TIME ZONE)) AS rental_duration,
+
+        f.title AS film_title
+    FROM
+        actor a
+    JOIN
+        film_actor fa ON a.actor_id = fa.actor_id
+    JOIN
+        film f ON fa.film_id = f.film_id
+    JOIN
+        inventory i ON f.film_id = i.film_id
+    JOIN
+        rental r ON i.inventory_id = r.inventory_id;
+END;
+$$;
+
+
+CALL update_actor_rental_details();
+
+
+CREATE OR REPLACE FUNCTION get_actor_rental_details()
+RETURNS TABLE (
+    rental_id INT,
+    actor_first_name TEXT,
+    actor_last_name TEXT,
+    rental_date DATE,
+    return_date DATE,
+    rental_duration_formatted TEXT,
+    film_title TEXT
+)
+LANGUAGE PLPGSQL
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        actor_rental_details.rental_id,
+        actor_rental_details.actor_first_name,
+        actor_rental_details.actor_last_name,
+        actor_rental_details.rental_date,
+        actor_rental_details.return_date,
+        format_duration(actor_rental_details.rental_duration) AS rental_duration_formatted,
+        actor_rental_details.film_title
+    FROM
+        actor_rental_details;
+END;
+$$;
+
+-- can use AWS Lambda to schedule execution of this stored procedure
+CREATE OR REPLACE PROCEDURE refresh_rental_data()
+LANGUAGE plpgsql
+AS $$
+BEGIN
+
+    DELETE FROM actor_rental_details;
+
+
+    DELETE FROM actor_rental_summary;
+
+
+    INSERT INTO actor_rental_details (
+        rental_id,
+        actor_id,
+        actor_first_name,
+        actor_last_name,
+        rental_date,
+        return_date,
+        rental_duration,
+        film_title
+    )
+    SELECT
+        r.rental_id,
+        a.actor_id,
+        a.first_name,
+        a.last_name,
+        r.rental_date,
+        r.return_date,
+        calculate_rental_duration(r.rental_date, r.return_date) AS rental_duration,
+        f.title AS film_title
+    FROM
+        actor a
+    JOIN
+        film_actor fa ON a.actor_id = fa.actor_id
+    JOIN
+        film f ON fa.film_id = f.film_id
+    JOIN
+        inventory i ON f.film_id = i.film_id
+    JOIN
+        rental r ON i.inventory_id = r.inventory_id;
+
+    INSERT INTO actor_rental_summary (
+        actor_id,
+        first_name,
+        last_name,
+        total_rentals,
+        avg_rental_duration
+    )
+    SELECT
+        actor_id,
+        first_name,
+        last_name,
+        COUNT(*),
+        AVG(rental_duration)
+    FROM
+        actor_rental_details
+    GROUP BY
+        actor_id, first_name, last_name;
+END;
+$$;
+
+
+
+BEGIN;
+SELECT * FROM get_actor_rental_details();
+ROLLBACK; 
+
+
+
+--SELECT *
+--FROM actor_rental_details;
+
+
+
+SELECT first_name, last_name, total_rentals, format_duration(avg_rental_duration) AS avg_duration_formatted
+FROM actor_rental_summary
+ORDER BY total_rentals DESC;
+--("PostgreSQL Sample Database," n.d.)
